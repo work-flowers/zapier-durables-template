@@ -55,7 +55,9 @@ left wrong:
   `docs/map-overlay.json`). It's genuinely useful, but it carries a per-repo
   curation burden and publishes to GitHub Pages, which isn't automatically
   appropriate for a client repo. To adopt it, copy those three files from
-  `work-flowers/zapier-sdk` and change `GITHUB_BASE` in `build-map.mjs`.
+  `work-flowers/zapier-sdk`, change `GITHUB_BASE` in `build-map.mjs`, and add
+  the map back to `publish-zaps.yml` — the sync-back step regenerates it there
+  so a first publish (which fills in `workflow_id`) can't leave the map stale.
 - **Any Zap.** The template ships the pipeline, rules and skills only.
 
 ## 6. How the shared rules stay current
