@@ -1,6 +1,6 @@
 # Sync the shared durables rules from the template repo
 #
-# `.claude/rules/durables.md` is the universal half of this repo's Claude Code
+# `.claude/rules/*.md` are the universal half of this repo's Claude Code
 # instructions — publish pipeline, trigger handling, the determinism guard, the
 # empty-ping guard, AI tiers, concurrency. It is deliberately BYTE-IDENTICAL
 # across every Zap repo so a lesson learned in one reaches all of them.
@@ -38,7 +38,9 @@ concurrency:
 
 env:
   UPSTREAM_REPO: work-flowers/zapier-durables-template
-  RULES_PATH: .claude/rules/durables.md
+  # The whole directory, not one file — the shared rules are a SET
+  # (durables.md + durables-sdk.md), and a new one can be added upstream.
+  RULES_DIR: .claude/rules
 
 jobs:
   sync:
@@ -58,41 +60,53 @@ jobs:
         run: |
           if [ -z "$GH_TOKEN" ]; then
             echo "No TEMPLATE_SYNC_TOKEN set — skipping." >> "$GITHUB_STEP_SUMMARY"
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            exit 0
+            echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
           fi
-          if ! gh api "repos/$UPSTREAM_REPO/contents/$RULES_PATH" \
-                 -H "Accept: application/vnd.github.raw" > /tmp/upstream.md; then
-            echo "Could not read $RULES_PATH from $UPSTREAM_REPO." >> "$GITHUB_STEP_SUMMARY"
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            exit 0
+          rm -rf /tmp/upstream-rules && mkdir -p /tmp/upstream-rules
+          if ! gh api "repos/$UPSTREAM_REPO/contents/$RULES_DIR" --jq '.[] | select(.name|endswith(".md")) | .name' > /tmp/names.txt; then
+            echo "Could not list $RULES_DIR in $UPSTREAM_REPO." >> "$GITHUB_STEP_SUMMARY"
+            echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
           fi
-          # A truncated or empty fetch must never overwrite good local rules.
-          if [ ! -s /tmp/upstream.md ]; then
-            echo "Upstream copy was empty — refusing to overwrite." >> "$GITHUB_STEP_SUMMARY"
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            exit 0
+          # An empty listing must never be read as "upstream deleted everything".
+          if [ ! -s /tmp/names.txt ]; then
+            echo "Upstream listed no rules files — refusing to wipe local rules." >> "$GITHUB_STEP_SUMMARY"
+            echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
           fi
+          while read -r n; do
+            [ -z "$n" ] && continue
+            gh api "repos/$UPSTREAM_REPO/contents/$RULES_DIR/$n" \
+              -H "Accept: application/vnd.github.raw" > "/tmp/upstream-rules/$n" || {
+                echo "Failed fetching $n — skipping this run." >> "$GITHUB_STEP_SUMMARY"
+                echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0; }
+            # A truncated or empty file must never overwrite good local rules.
+            if [ ! -s "/tmp/upstream-rules/$n" ]; then
+              echo "Upstream $n was empty — refusing to overwrite." >> "$GITHUB_STEP_SUMMARY"
+              echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
+            fi
+          done < /tmp/names.txt
           echo "skip=false" >> "$GITHUB_OUTPUT"
 
       - name: Compare
         id: diff
         if: steps.fetch.outputs.skip == 'false'
         run: |
-          if cmp -s /tmp/upstream.md "$RULES_PATH"; then
+          mkdir -p "$RULES_DIR"
+          if diff -rq /tmp/upstream-rules "$RULES_DIR" >/dev/null 2>&1; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
             echo "Shared rules already match \`$UPSTREAM_REPO\`." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          cp /tmp/upstream.md "$RULES_PATH"
+          rm -f "$RULES_DIR"/*.md
+          cp /tmp/upstream-rules/*.md "$RULES_DIR"/
           echo "changed=true" >> "$GITHUB_OUTPUT"
           {
             echo "## Shared rules changed"
             echo
-            echo "Upstream: \`$UPSTREAM_REPO\`"
+            echo "Upstream: \`$UPSTREAM_REPO\` — set version:"
+            head -1 "$RULES_DIR"/durables.md 2>/dev/null || true
             echo
             echo '```diff'
-            git diff --unified=2 -- "$RULES_PATH" | head -200
+            git diff --unified=2 -- "$RULES_DIR" | head -200
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -107,7 +121,7 @@ jobs:
           labels: rules
           delete-branch: true
           body: |
-            Automated sync of `.claude/rules/durables.md` from
+            Automated sync of `.claude/rules/` from
             `work-flowers/zapier-durables-template`.
 
             This file is the universal half of this repo's Claude Code
