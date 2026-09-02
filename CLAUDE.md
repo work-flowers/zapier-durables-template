@@ -34,9 +34,10 @@ The shared rules cite these helpers by name; record where this repo's copy lives
 
 <!-- Set this deliberately. It is NOT in the shared rules file precisely because
      it differs per repo, and a shared default would silently override the choice.
-     Pick one and delete the other. -->
+     Pick one, uncomment and delete the other. -->
 
-**Baseline: the Zapier MCP connector.** Use MCP tools (`list_workflows`, `get_workflow_version`, publish tools) as the default path; the Zapier SDK CLI is available but not assumed, so anyone working in this repo can be productive without a CLI login.
+<!-- **Baseline: the Zapier MCP connector.** Use MCP tools (`list_workflows`, `get_workflow_version`, publish tools) as the default path; the Zapier SDK CLI is available but not assumed, so anyone working in this repo can be productive without a CLI login.
+-->
 
 <!-- OR:
 **Baseline: the Zapier SDK CLI.** Prefer the CLI wherever possible — it's faster and
