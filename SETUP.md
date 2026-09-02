@@ -39,13 +39,8 @@ first two work before authoring a Zap.
 
 ## 4. Fill in `CLAUDE.md` before writing any Zap
 
-Two sections are blank on purpose and are the ones that cause silent damage if
-left wrong:
+Blank on purpose and may silently cause damage if left wrong:
 
-- **Connections** — every connection this repo binds, by alias, id, title and
-  which system it points at. A connection bound to the wrong workspace fails
-  with `Could not find data_source … shared with your integration "Zapier"`, or
-  worse, writes successfully to the wrong place.
 - **Tooling baseline** — MCP or CLI. Pick one, delete the other. This is
   deliberately not in the shared rules file so each repo can differ.
 
