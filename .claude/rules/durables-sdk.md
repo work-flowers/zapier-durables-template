@@ -34,6 +34,15 @@ Adding `--noUnusedLocals` catches constants left behind by a port. Where a Zap p
 
 Also watch the call shape: `defineDurable` takes `(name, async (ctx, rawInput) => …)`. The plausible-looking `(name, options, async (input, ctx) => …)` publishes fine and then fails at run time with `durable.run is not a function`.
 
+## The publish-time analyzer
+
+**`publish-workflow-version` runs a static analyzer over the source and refuses on what it finds** — `ZAPIER_VALIDATION_ERROR: Analyzer found N error(s)`. First seen 2026-09-03, on code that had published cleanly three weeks earlier, so any Zap's *next* republish can fail on patterns that were fine at its last one. The publisher aborts at the first failing directory, so nothing is half-published, but the repo sits ahead of Zapier until a fix PR touching every affected `workflow.ts` merges. Rules confirmed by probing (the kinds are "extensible", so expect more):
+
+- **`invalid-step-call` — in the workflow body, `ctx.step` needs a string-literal id and an inline async callback.** A template literal, the `{ name, run }` options form with a template, and a call expression as the id are all rejected. **The analyzer does not follow `ctx` into a helper**, so a step whose id must carry a loop index belongs in a function that takes `ctx` as a parameter — `helper(ctx, stepPrefix, …)` with ``ctx.step(`${stepPrefix}-${i}`, …)`` inside. The runtime still needs the index: two steps with one id in the same run collide.
+- **`out-of-range-durable-option` — `ctx.wait` seconds must be a safe integer 1..31536000.** The analyzer resolves constants and flags the literal at the *declaration*; a `> 0` guard around the call does not help. A retired `const X_SECONDS = 0` feeding a dead `ctx.wait` fails the publish — delete the dead call and leave a comment saying what to put back.
+
+Check locally with `npx zapier-sdk-experimental validate-workflow "$(jq -n --rawfile w workflow.ts '{"/workflow.ts": $w}')" --json` — the key must be the absolute logical path `/workflow.ts` (a bare `workflow.ts` is `Invalid key in record`). **The endpoint sits behind a CDN rule that returns `403 Request blocked` for bodies over a few KB**, so a real workflow file cannot be validated this way; probe the *pattern* in a small synthetic file, and grep the body (from the `defineDurable(` line down) for ``ctx.step(` `` and for `ctx.wait(` with a non-literal duration before publishing.
+
 ## Multi-file workflows
 
 **Multi-file `source_files` works** — verified 2026-08-05 on `@zapier/zapier-durable` **0.11.1 and 0.12.3**. Pass extra keys alongside `workflow.ts`: `{"workflow.ts": …, "helper.ts": …}`.
@@ -70,6 +79,9 @@ Any fan-out creates a cycle risk. Bound it explicitly: a hop counter refused pas
 - **Absorb the race where it happens, and let genuine rejections fail fast.**
 - **Make the retry provably terminate.** Recomputing "the next free value" can return the same value forever when the blocker is invisible to the computation. Step explicitly past the value just tried when the recomputed one has not moved, rather than trusting the recomputation to advance.
 - **Only retry an error that guarantees no write happened.** A retry on an ambiguous failure risks double-writing — a duplicate invoice, a duplicate order.
+- **Ask of every write whether REPLAYING it lands in the same state or errors. "Idempotent" is a property of the specific call, not of the HTTP verb.** A repeated `PATCH` of *properties* is harmless; a repeated `PATCH` that performs a *state transition* is not. Notion's `PATCH { in_trash: true }` on an already-trashed page answers `400 Can't edit block that is archived` — and because a 400 is (correctly) not retryable, the step throws on every attempt and kills the whole run **after the delete has already landed**. A real case: a sync applied 15/15 inserts and 492/492 updates, got 9 of 12 deletes done, then died on the tenth and left stale rows behind.
+  - **The trap is that this looks like the safe half of a fix.** The same codebase had just hardened its *creates* against exactly this ambiguity and stopped there, on the reasoning that "a repeated PATCH is harmless". Both non-idempotent operations needed covering, and enumerating them means asking the replay question of each call rather than sorting by verb.
+  - **The fix is to read the vendor's "already in that state" error as success**, matching *that* error only — the desired end state is the state you are being told it is already in. Keep the match narrow (status code AND message), so a `5xx` mentioning the same word stays retryable and every other `4xx` still throws, and make the predicate a pure exported function so the one string comparison that decides whether a run lives or dies is unit-tested rather than eyeballed.
 
 ## Guard design
 
