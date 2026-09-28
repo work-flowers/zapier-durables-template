@@ -44,7 +44,8 @@
 // Without --execute it prints the plan and touches nothing — a deeper dry run.
 
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync, appendFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, appendFileSync, readdirSync, mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { detectChangedZaps } from "./detect-changed-zaps.mjs";
 
@@ -109,6 +110,56 @@ function sdk(rest) {
     cwd: REPO_ROOT,
     encoding: "utf8",
     maxBuffer: 64 * 1024 * 1024,
+  });
+  return JSON.parse(raw);
+}
+
+// ---- Creating a container with an EXPLICIT visibility ----------------------
+// The CLI cannot say "account-visible": `create-workflow` has `--private` and no
+// negation, and when the flag is absent the SDK leaves `is_private` out of the
+// request body entirely (`if (isPrivate !== void 0) body.is_private = ...`,
+// identical in @zapier/zapier-sdk 0.112.3 and 0.112.4). The server then applies
+// ITS default — and that default changed. Every container this pipeline created
+// up to 2026-09-22 came out account-visible; qb-po-to-container, created on
+// 2026-09-28 by the same code with is_private: false in zap.json and no
+// --private, came out PRIVATE. Visibility cannot be changed after create, so
+// relying on a server default for it is not acceptable.
+//
+// So the create goes through the SDK directly, where `private: false` IS sent,
+// and createAndPublish reads the container back and refuses to publish into it
+// if the visibility is not what zap.json declared.
+const CREATE_SDK_VERSION = "0.112.4";
+
+function createWorkflowExplicit({ name, description, isPrivate }) {
+  const dir = mkdtempSync(join(tmpdir(), "zapier-create-"));
+  writeFileSync(join(dir, "package.json"), JSON.stringify({ type: "module", private: true }));
+  execFileSync(
+    "npm",
+    ["install", "--no-save", "--silent", "--no-audit", "--no-fund", `@zapier/zapier-sdk@${CREATE_SDK_VERSION}`],
+    { cwd: dir, stdio: ["ignore", "ignore", "inherit"] },
+  );
+  writeFileSync(
+    join(dir, "create.mjs"),
+    [
+      'import { createZapierSdk } from "@zapier/zapier-sdk/experimental";',
+      "const a = JSON.parse(process.env.CREATE_ARGS);",
+      "const sdk = createZapierSdk({ credentials: { clientId: process.env.CREATE_CLIENT_ID, clientSecret: process.env.CREATE_CLIENT_SECRET } });",
+      // `private` is always a boolean here — never omitted — so the request
+      // body always carries is_private and no server default applies.
+      "const res = await sdk.createWorkflow({ name: a.name, description: a.description, private: a.isPrivate === true });",
+      "process.stdout.write(JSON.stringify(res));",
+    ].join("\n"),
+  );
+  const raw = execFileSync("node", ["create.mjs"], {
+    cwd: dir,
+    encoding: "utf8",
+    maxBuffer: 16 * 1024 * 1024,
+    env: {
+      ...process.env,
+      CREATE_ARGS: JSON.stringify({ name, description, isPrivate }),
+      CREATE_CLIENT_ID: CLIENT_ID,
+      CREATE_CLIENT_SECRET: CLIENT_SECRET,
+    },
   });
   return JSON.parse(raw);
 }
@@ -200,6 +251,14 @@ function validateTrigger(dir, trigger) {
   return trigger;
 }
 
+// A catch hook is the one trigger kind Zapier ISSUES a URL for, and that URL is
+// the only address an external sender (a Notion automation, Luma, Linear,
+// another Zap) can call. Everything else claims a trigger on the app side and
+// is handed no URL at all.
+function isCatchHookTrigger(trigger) {
+  return String(trigger?.selected_api || "").startsWith("WebHookCLIAPI");
+}
+
 // Where a deployment's trigger block lives in zap.json: per-deployment for a
 // multi-deployment dir (whatsapp-slack-bridge, esignatures-*, ...), top-level
 // otherwise. A MISSING key is a refusal, not a fallback — publishing without
@@ -261,6 +320,22 @@ function readCreateSpec(dir) {
 
   const trigger = validateTrigger(dir, zap.trigger);
 
+  // The catch URL is READ BACK after publishing and written by replacing a
+  // literal `"webhook_url": null`, so the key has to be there before the
+  // publish or the readback lands nowhere. It is the only place the URL is
+  // recorded, and losing it is silent: the repo keeps `trigger_url`, which is
+  // Zapier-internal and answers an unauthenticated POST with 401, so the file
+  // reads as if it holds the URL when it does not. This is what happened to
+  // notion-review-to-company-logo on 2026-09-06 (PR #153) — published fine,
+  // catch URL printed in the run summary, nothing in zap.json.
+  if (trigger && isCatchHookTrigger(trigger) && trigger.webhook_url !== null) {
+    const what = "webhook_url" in trigger ? `already set to ${JSON.stringify(trigger.webhook_url)}` : "absent";
+    fail(
+      `${dir}: a catch-hook trigger must declare "webhook_url": null before its first publish (${what}) — ` +
+        `Zapier issues the URL at publish time and the sync-back needs the key to write it into.`,
+    );
+  }
+
   // publish wants { alias: { connectionId } }; zap.json stores { alias: id }.
   const connections = {};
   for (const [alias, value] of Object.entries(zap.connections || {})) {
@@ -310,13 +385,28 @@ function createAndPublish(dir, dep, execute) {
 
   if (!execute) return { plan };
 
-  // 1. Create the container. --private is the ONLY chance to set visibility.
-  const createArgs = ["create-workflow", spec.workflowName, "--description", spec.description];
-  if (spec.isPrivate) createArgs.push("--private");
-  const created = unwrap(sdk(createArgs));
+  // 1. Create the container. This is the ONLY chance to set visibility, so it
+  //    is sent explicitly (see createWorkflowExplicit) — never left to a
+  //    server default.
+  const created = unwrap(
+    createWorkflowExplicit({ name: spec.workflowName, description: spec.description, isPrivate: spec.isPrivate }),
+  );
   const workflowId = created?.id || created?.workflow?.id || null;
   if (!workflowId) {
     fail(`${dir}: create-workflow returned no id — response: ${JSON.stringify(created)}`);
+  }
+
+  // 1b. Verify the visibility BEFORE any code goes into the container. A wrong
+  //     one is unrecoverable, and an empty container is the cheapest thing to
+  //     throw away: stop here so nothing is published into it.
+  const fresh = unwrap(sdk(["get-workflow", workflowId]));
+  if (typeof fresh?.is_private === "boolean" && fresh.is_private !== spec.isPrivate) {
+    fail(
+      `${dir}: CREATED ${workflowId} with is_private=${fresh.is_private}, but zap.json declares ` +
+        `is_private=${spec.isPrivate}. Visibility cannot be changed after create, so NOTHING was published into it. ` +
+        `Delete that empty container (delete-workflow ${workflowId}) and fix the create call before re-running; ` +
+        `zap.json is unchanged, so a re-run creates a fresh one.`,
+    );
   }
 
   // 2. Publish v1 from the declared metadata.
@@ -374,8 +464,12 @@ function createAndPublish(dir, dep, execute) {
     workflowId,
     newVersionId,
     triggerUrl: after?.trigger_url || created?.trigger_url || null,
-    // Present only for catch-hook triggers; this is the URL external services call.
+    // A catch hook's details.webhook_url is the URL external services call.
+    // Polling triggers report one too (hooks/standard/...), but it is Zapier's
+    // internal subscription plumbing — nothing POSTs to it — so it is recorded
+    // only when zap.json asks for it, and its absence is never a failure.
     webhookUrl: afterTriggers[0]?.details?.webhook_url || null,
+    webhookRequired: isCatchHookTrigger(spec.trigger),
     enabled: typeof after?.enabled === "boolean" ? after.enabled : spec.enableOnPublish,
   };
 }
@@ -588,7 +682,7 @@ export function syncBackWebhookUrl(dir, oldUrl, newUrl) {
 // pending state. Same in-place, value-targeted replacement as above so the rest
 // of the file stays byte-for-byte (a JSON round-trip would re-encode every
 // escape and reformat the whole file).
-function syncBackFirstPublish(dir, { workflowId, newVersionId, triggerUrl, webhookUrl, enabled }) {
+function syncBackFirstPublish(dir, { workflowId, newVersionId, triggerUrl, webhookUrl, webhookRequired = true, enabled }) {
   const abs = join(REPO_ROOT, dir, "zap.json");
   let raw = readFileSync(abs, "utf8");
 
@@ -605,7 +699,26 @@ function syncBackFirstPublish(dir, { workflowId, newVersionId, triggerUrl, webho
   setNull("workflow_id", workflowId, true);
   setNull("current_version_id", newVersionId, true);
   setNull("trigger_url", triggerUrl, false);
-  setNull("webhook_url", webhookUrl, false);
+
+  // NOT optional when Zapier issued one. readCreateSpec refuses a catch-hook
+  // trigger that does not declare `"webhook_url": null`, so a missing target
+  // here means the file changed between that refusal and this write. Fail
+  // naming the URL: it is live, it is what senders must call, and it exists
+  // nowhere else in the repo once this process exits.
+  if (webhookUrl) {
+    const hookRe = /("webhook_url":\s*)null/;
+    if (!hookRe.test(raw) && !webhookRequired) {
+      log(`- ℹ️ ${dir}: not a catch hook; its internal webhook_url ${webhookUrl} is not recorded (no "webhook_url": null key)`);
+    } else if (!hookRe.test(raw)) {
+      fail(
+        `${dir}: PUBLISHED, and Zapier issued catch URL ${webhookUrl}, but zap.json has no ` +
+          `"webhook_url": null to write it into. Add "webhook_url": "${webhookUrl}" to the trigger ` +
+          `block by hand — this URL is recorded nowhere else.`,
+      );
+    } else {
+      raw = raw.replace(hookRe, '$1"' + webhookUrl + '"');
+    }
+  }
 
   // Record what Zapier actually reports, so a parked Zap reads as parked.
   // Anchored to the top-level key (two-space indent) so a nested "enabled"
