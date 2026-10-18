@@ -1,17 +1,22 @@
 #!/usr/bin/env node
 // Publish the durable Zaps affected by a merge, and sync current_version_id
-// back into each zap.json (repo rule 4).
+// (plus that version's version_created_at) back into each zap.json (repo rule 4).
 //
 // Consumes the same detection layer as the dry run (detectChangedZaps), then,
 // for each affected deployment, mirrors the workflows-modify "direct publish"
 // path: fetch the DEPLOYED version's metadata, rebuild source_files from the
 // repo, and republish carrying that metadata forward — dependencies, durable
-// version, connections and app-versions. Getting the trigger-vs-manual start
+// version and app-versions. Getting the trigger-vs-manual start
 // mode wrong silently drops a live trigger, so this script REFUSES (non-zero
 // exit, nothing published) on anything ambiguous rather than guessing:
 //
-// The TRIGGER is the one thing not carried forward: zap.json is its source of
-// truth, the same way it is for the code. Every republish compares the trigger
+// The TRIGGER and the CONNECTION BINDINGS are not carried forward blindly:
+// zap.json is their source of truth, the same way it is for the code. Bindings
+// zap.json declares replace the deployed ones when they differ (a Zap that
+// swaps one app connection for another would otherwise carry the old set
+// forward and leave the new alias unbound — a publish that succeeds and then
+// fails on the first run); a zap.json with no
+// `connections` keeps the deployed set. Every republish compares the trigger
 // zap.json declares against the deployed one, on the four fields that are
 // actually Zapier's (selected_api, action, authentication_id, params — the rest
 // of the block is repo annotation and a webhook_url readback). Identical, the
@@ -26,7 +31,7 @@
 // chance to set visibility), publish v1 from the metadata DECLARED in zap.json
 // (there is no live version to read it off), disable it when
 // `deploy.enable_on_publish` is false, then sync workflow_id /
-// current_version_id / trigger_url / enabled back. So a brand-new Zap ships
+// current_version_id / version_created_at / trigger_url / enabled back. So a brand-new Zap ships
 // exactly like a change to an existing one: open a PR, merge it, CI publishes.
 // Every subsequent change takes the republish path above.
 //   - the workflow has an open draft (a direct publish would 409 anyway),
@@ -104,64 +109,77 @@ function sdkArgs(rest) {
   ];
 }
 
-// Run a CLI command and parse its JSON. Throws with stderr on failure.
+// Run a CLI command and parse its JSON. execFileSync's own error message is the
+// full command line (megabytes of inline source on a publish) with the server's
+// actual complaint left on err.stderr — so failures rethrow the captured
+// stderr/stdout instead, or the 2026-09-01 sweep publish failure repeats with
+// nothing in the log but the command that failed.
 function sdk(rest) {
-  const raw = execFileSync("npx", sdkArgs(rest), {
-    cwd: REPO_ROOT,
-    encoding: "utf8",
-    maxBuffer: 64 * 1024 * 1024,
-  });
+  let raw;
+  try {
+    raw = execFileSync("npx", sdkArgs(rest), {
+      cwd: REPO_ROOT,
+      encoding: "utf8",
+      maxBuffer: 64 * 1024 * 1024,
+    });
+  } catch (err) {
+    const stderr = (err.stderr ?? "").toString().trim();
+    const stdout = (err.stdout ?? "").toString().trim();
+    const detail = [stderr, stdout].filter(Boolean).join("\n--- stdout ---\n").slice(0, 4000);
+    fail(
+      `zapier-sdk ${rest[0]} failed (exit ${err.status ?? "?"})` +
+        (detail ? `:\n${detail}` : ` — no stderr/stdout captured: ${String(err.message).slice(0, 300)}`),
+    );
+  }
   return JSON.parse(raw);
 }
 
-// ---- Creating a container with an EXPLICIT visibility ----------------------
-// The CLI cannot say "account-visible": `create-workflow` has `--private` and no
-// negation, and when the flag is absent the SDK leaves `is_private` out of the
-// request body entirely (`if (isPrivate !== void 0) body.is_private = ...`,
-// identical in @zapier/zapier-sdk 0.112.3 and 0.112.4). The server then applies
-// ITS default — and that default changed. Every container this pipeline created
-// up to 2026-09-22 came out account-visible; qb-po-to-container, created on
-// 2026-09-28 by the same code with is_private: false in zap.json and no
-// --private, came out PRIVATE. Visibility cannot be changed after create, so
-// relying on a server default for it is not acceptable.
-//
-// So the create goes through the SDK directly, where `private: false` IS sent,
-// and createAndPublish reads the container back and refuses to publish into it
-// if the visibility is not what zap.json declared.
+// Create a workflow container with its visibility STATED, never defaulted.
+// The CLI's create-workflow can only say `--private`: without it, is_private is
+// left out of the request and Zapier's server-side default decides. That default
+// changed: containers created up to 2026-09-22 came out account-visible, while
+// creates on 2026-09-25..28 with `"is_private": false` in zap.json and no flag
+// came out PRIVATE (identical client code in SDK 0.112.3 and 0.112.4, so the
+// change was server-side) — and visibility cannot be changed after creation.
+// The SDK method sends is_private whenever it is given, so the create goes
+// through it: installed once into a temp prefix (this repo has no
+// package.json), then run with that prefix as cwd so the bare import resolves.
+// Pinned so a new SDK release can't change the create call underneath us.
 const CREATE_SDK_VERSION = "0.112.4";
-
-function createWorkflowExplicit({ name, description, isPrivate }) {
-  const dir = mkdtempSync(join(tmpdir(), "zapier-create-"));
-  writeFileSync(join(dir, "package.json"), JSON.stringify({ type: "module", private: true }));
-  execFileSync(
-    "npm",
-    ["install", "--no-save", "--silent", "--no-audit", "--no-fund", `@zapier/zapier-sdk@${CREATE_SDK_VERSION}`],
-    { cwd: dir, stdio: ["ignore", "ignore", "inherit"] },
-  );
-  writeFileSync(
-    join(dir, "create.mjs"),
-    [
-      'import { createZapierSdk } from "@zapier/zapier-sdk/experimental";',
-      "const a = JSON.parse(process.env.CREATE_ARGS);",
-      "const sdk = createZapierSdk({ credentials: { clientId: process.env.CREATE_CLIENT_ID, clientSecret: process.env.CREATE_CLIENT_SECRET } });",
-      // `private` is always a boolean here — never omitted — so the request
-      // body always carries is_private and no server default applies.
-      "const res = await sdk.createWorkflow({ name: a.name, description: a.description, private: a.isPrivate === true });",
-      "process.stdout.write(JSON.stringify(res));",
-    ].join("\n"),
-  );
-  const raw = execFileSync("node", ["create.mjs"], {
-    cwd: dir,
-    encoding: "utf8",
-    maxBuffer: 16 * 1024 * 1024,
-    env: {
-      ...process.env,
-      CREATE_ARGS: JSON.stringify({ name, description, isPrivate }),
-      CREATE_CLIENT_ID: CLIENT_ID,
-      CREATE_CLIENT_SECRET: CLIENT_SECRET,
-    },
-  });
-  return JSON.parse(raw);
+let sdkPrefix = null;
+function createWorkflowExplicit(name, description, isPrivate) {
+  if (!sdkPrefix) {
+    sdkPrefix = mkdtempSync(join(tmpdir(), "zapier-sdk-"));
+    execFileSync("npm", ["install", "--no-save", "--silent", "--prefix", sdkPrefix, `@zapier/zapier-sdk@${CREATE_SDK_VERSION}`], {
+      stdio: ["ignore", "ignore", "inherit"],
+    });
+  }
+  const code = [
+    'import { createZapierSdk } from "@zapier/zapier-sdk/experimental";',
+    "const sdk = createZapierSdk({ credentials: { clientId: process.env.ZAPIER_CLIENT_ID, clientSecret: process.env.ZAPIER_CLIENT_SECRET } });",
+    "const result = await sdk.createWorkflow(JSON.parse(process.env.CREATE_WORKFLOW_INPUT));",
+    'process.stdout.write("\\n__CREATE_WORKFLOW_RESULT__" + JSON.stringify(result) + "\\n");',
+  ].join("\n");
+  let raw;
+  try {
+    raw = execFileSync("node", ["--input-type=module", "-e", code], {
+      cwd: sdkPrefix,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        CREATE_WORKFLOW_INPUT: JSON.stringify({ name, description, private: isPrivate }),
+      },
+    });
+  } catch (err) {
+    const detail = [(err.stderr ?? "").toString().trim(), (err.stdout ?? "").toString().trim()]
+      .filter(Boolean)
+      .join("\n--- stdout ---\n")
+      .slice(0, 4000);
+    fail(`createWorkflow failed (exit ${err.status ?? "?"})` + (detail ? `:\n${detail}` : ""));
+  }
+  const line = raw.split("\n").find((l) => l.startsWith("__CREATE_WORKFLOW_RESULT__"));
+  if (!line) fail(`createWorkflow printed no result — output: ${raw.slice(0, 2000)}`);
+  return JSON.parse(line.slice("__CREATE_WORKFLOW_RESULT__".length));
 }
 
 // Some CLI responses wrap the payload in { data: ... }; some don't.
@@ -253,8 +271,16 @@ function validateTrigger(dir, trigger) {
 
 // A catch hook is the one trigger kind Zapier ISSUES a URL for, and that URL is
 // the only address an external sender (a Notion automation, Luma, Linear,
-// another Zap) can call. Everything else claims a trigger on the app side and
-// is handed no URL at all.
+// another Zap) can call. Everything else claims a trigger on the app side.
+//
+// "Handed no URL at all" is NOT true of the readback, though: a Schedule
+// trigger comes back from get-workflow with `details.webhook_url` set to a
+// `/hooks/standard/...` endpoint — Zapier-internal plumbing that nothing
+// external calls. The sync-back must therefore filter on trigger kind rather
+// than on the presence of a URL. Without that filter, republishing a
+// Schedule-triggered Zap publishes fine and then dies in the sync-back with
+// "Zapier reports catch URL ... but zap.json records none", leaving the repo
+// one version behind and the run summary red (seen 2026-09-08).
 function isCatchHookTrigger(trigger) {
   return String(trigger?.selected_api || "").startsWith("WebHookCLIAPI");
 }
@@ -284,6 +310,41 @@ export function resolveTriggerBlock(dir, dep) {
     }
   }
   return validateTrigger(dir, block ?? null);
+}
+
+// ---- Connection bindings: zap.json wins when it declares any ---------------
+//
+// publish wants { alias: { connectionId } }; zap.json stores { alias: id } —
+// top-level, or per deployment in a multi-deployment dir when the entry has its
+// own `connections`. Non-string values are repo notes, not bindings.
+export function declaredConnections(dir, dep) {
+  const zap = JSON.parse(readFileSync(join(REPO_ROOT, dir, "zap.json"), "utf8"));
+  let source = zap.connections;
+  if (Array.isArray(zap.deployments)) {
+    const d = zap.deployments.find((x) => x.workflow_id === dep.workflowId);
+    if (d && d.connections !== undefined) source = d.connections;
+  }
+  const out = {};
+  for (const [alias, value] of Object.entries(source || {})) {
+    if (typeof value !== "string") continue;
+    out[alias] = { connectionId: value };
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+// Alias → id, in either shape, order-insensitive.
+export function connectionIds(c) {
+  const out = {};
+  for (const [alias, v] of Object.entries(c || {})) {
+    const id = v && typeof v === "object" ? v.connectionId ?? v.connection_id ?? null : v;
+    if (typeof id === "string") out[alias] = id;
+  }
+  return out;
+}
+
+export function sameConnections(a, b) {
+  const norm = (c) => JSON.stringify(Object.entries(connectionIds(c)).sort());
+  return norm(a) === norm(b);
 }
 
 // ---- First publish of a brand-new Zap -----------------------------------
@@ -386,28 +447,30 @@ function createAndPublish(dir, dep, execute) {
   if (!execute) return { plan };
 
   // 1. Create the container. This is the ONLY chance to set visibility, so it
-  //    is sent explicitly (see createWorkflowExplicit) — never left to a
-  //    server default.
-  const created = unwrap(
-    createWorkflowExplicit({ name: spec.workflowName, description: spec.description, isPrivate: spec.isPrivate }),
-  );
+  // is sent explicitly either way (see createWorkflowExplicit) and read back.
+  const created = unwrap(createWorkflowExplicit(spec.workflowName, spec.description, spec.isPrivate));
   const workflowId = created?.id || created?.workflow?.id || null;
   if (!workflowId) {
     fail(`${dir}: create-workflow returned no id — response: ${JSON.stringify(created)}`);
   }
-
-  // 1b. Verify the visibility BEFORE any code goes into the container. A wrong
-  //     one is unrecoverable, and an empty container is the cheapest thing to
-  //     throw away: stop here so nothing is published into it.
-  const fresh = unwrap(sdk(["get-workflow", workflowId]));
-  if (typeof fresh?.is_private === "boolean" && fresh.is_private !== spec.isPrivate) {
+  // Read it back from get-workflow rather than trusting the create response:
+  // the server's view is what decides who can see the Zap.
+  const readBack = unwrap(sdk(["get-workflow", workflowId]));
+  const actualPrivate = readBack?.is_private ?? readBack?.workflow?.is_private;
+  if (actualPrivate !== spec.isPrivate) {
+    // Wrong visibility is unrecoverable, so the container must not survive to
+    // be published. It has no version yet, so deleting it loses nothing.
+    sdk(["delete-workflow", workflowId]);
     fail(
-      `${dir}: CREATED ${workflowId} with is_private=${fresh.is_private}, but zap.json declares ` +
-        `is_private=${spec.isPrivate}. Visibility cannot be changed after create, so NOTHING was published into it. ` +
-        `Delete that empty container (delete-workflow ${workflowId}) and fix the create call before re-running; ` +
-        `zap.json is unchanged, so a re-run creates a fresh one.`,
+      `${dir}: Zapier created \`${workflowId}\` with is_private=${actualPrivate} although zap.json ` +
+        `declares ${spec.isPrivate} — deleted it rather than publish a Zap whose visibility can never be fixed`,
     );
   }
+  // Say the id NOW, before the publish. If the first publish fails (the
+  // analyzer, a bad connection), the container already exists with no version
+  // and the only way to find or delete it is this id — which otherwise appears
+  // nowhere in the run log. Seen 2026-09-25.
+  log(`- 🆕 created container \`${workflowId}\` — publishing v1…`);
 
   // 2. Publish v1 from the declared metadata.
   const rest = ["publish-workflow-version", workflowId, JSON.stringify(sourceFiles)];
@@ -463,6 +526,7 @@ function createAndPublish(dir, dep, execute) {
     plan,
     workflowId,
     newVersionId,
+    versionCreatedAt: createdAtOf(published),
     triggerUrl: after?.trigger_url || created?.trigger_url || null,
     // A catch hook's details.webhook_url is the URL external services call.
     // Polling triggers report one too (hooks/standard/...), but it is Zapier's
@@ -494,7 +558,7 @@ function publishDeployment(dir, dep, currentVersionId, execute) {
 
   const dependencies = version?.dependencies ?? null;
   const durableVersion = version?.zapier_durable_version ?? null;
-  const connections = version?.connections ?? null;
+  const deployedConnections = version?.connections ?? null;
   const appVersions = version?.app_versions ?? null;
   const deployedTrigger = version?.trigger ?? null;
 
@@ -503,10 +567,20 @@ function publishDeployment(dir, dep, currentVersionId, execute) {
   const desired = resolveTriggerBlock(dir, dep);
   const triggerChanged = !sameTrigger(desired, deployedTrigger);
 
-  // 3. This deployment is only here because zap.json changed, and the trigger it
-  //    declares is what is already live: nothing to publish. (Checked BEFORE the
-  //    draft refusal below, so an open draft can't fail a run that is a no-op.)
-  if (!dep.bySource && !triggerChanged) {
+  // 2b. Same for the connection bindings, when zap.json declares any: a Zap
+  //     that swaps an app has a new alias in its source, and carrying the
+  //     deployed set forward would publish fine and fail on the first run with
+  //     that alias unbound. A zap.json with no `connections` keeps the deployed
+  //     set (it is not declaring anything).
+  const declared = declaredConnections(dir, dep);
+  const connectionsChanged = declared != null && !sameConnections(declared, deployedConnections);
+  const connections = connectionsChanged ? declared : deployedConnections;
+
+  // 3. This deployment is only here because zap.json changed, and neither the
+  //    trigger nor the bindings it declares differ from what is live: nothing
+  //    to publish. (Checked BEFORE the draft refusal below, so an open draft
+  //    can't fail a run that is a no-op.)
+  if (!dep.bySource && !triggerChanged && !connectionsChanged) {
     return { skipped: "no-trigger-change", workflowId: id };
   }
 
@@ -553,17 +627,26 @@ function publishDeployment(dir, dep, currentVersionId, execute) {
     hasConnections: connections != null,
     hasAppVersions: appVersions != null,
     triggerChanged,
-    reason: dep.bySource ? (triggerChanged ? "source + trigger" : "source") : "trigger",
+    connectionsChanged,
+    reason: [
+      dep.bySource ? "source" : null,
+      triggerChanged ? "trigger" : null,
+      connectionsChanged ? "connections" : null,
+    ]
+      .filter(Boolean)
+      .join(" + "),
     triggerFrom: triggerCore(deployedTrigger),
     triggerTo: triggerCore(desired),
+    connectionsFrom: connectionIds(deployedConnections),
+    connectionsTo: connectionIds(connections),
   };
 
   if (!execute) return { plan };
 
-  // 9. Publish, carrying every piece of metadata forward. The trigger is the one
-  //    exception: unchanged, the deployed object goes back verbatim (so a field
-  //    the canonical core doesn't model can't be dropped); changed, the repo's
-  //    declared core replaces it.
+  // 9. Publish, carrying every piece of metadata forward. The trigger and the
+  //    bindings are the exceptions: unchanged, the deployed object goes back
+  //    verbatim (so a field the canonical core doesn't model can't be dropped);
+  //    changed, the repo's declared one replaces it.
   const rest = ["publish-workflow-version", id, JSON.stringify(sourceFiles)];
   if (dependencies != null) rest.push("--dependencies", JSON.stringify(dependencies));
   if (durableVersion != null) rest.push("--zapier-durable-version", String(durableVersion));
@@ -636,10 +719,11 @@ function publishDeployment(dir, dep, currentVersionId, execute) {
   return {
     plan,
     newVersionId,
+    versionCreatedAt: createdAtOf(published),
     triggerChanged,
-    // Present only for catch-hook triggers; a changed trigger can be issued a
+    // Only a catch hook is handed a URL (see isCatchHookTrigger); a changed trigger can be issued a
     // NEW catch URL, which has to land back in zap.json.
-    webhookUrl: afterTriggers[0]?.details?.webhook_url || null,
+    webhookUrl: isCatchHookTrigger(afterTriggers[0]) ? afterTriggers[0]?.details?.webhook_url || null : null,
     declaredWebhookUrl: desired?.webhook_url ?? null,
   };
 }
@@ -662,20 +746,114 @@ function syncBackVersionId(dir, oldVersionId, newVersionId) {
   writeFileSync(abs, raw.replace(re, `$1${newVersionId}$2`));
 }
 
+// The publish response is the new version; its created_at is what zap.json
+// records as version_created_at. Null when the response does not carry it, in
+// which case main() reads the version back.
+function createdAtOf(published) {
+  const v = published?.version?.created_at ?? published?.created_at ?? null;
+  return typeof v === "string" && v ? v : null;
+}
+
+// Index of the "{" opening the innermost JSON object that contains position
+// `pos`, or -1. String-aware, so braces inside values do not count.
+function enclosingObjectStart(raw, pos) {
+  const stack = [];
+  let inString = false;
+  for (let i = 0; i < pos; i++) {
+    const c = raw[i];
+    if (inString) {
+      if (c === "\\") i++;
+      else if (c === '"') inString = false;
+    } else if (c === '"') inString = true;
+    else if (c === "{") stack.push(i);
+    else if (c === "}") stack.pop();
+  }
+  return stack.length ? stack[stack.length - 1] : -1;
+}
+
+// Set version_created_at in the SAME object as `"current_version_id":
+// "<versionId>"` — the right deployment's entry in a multi-deployment file,
+// since each carries a distinct version id. Pure (text in, text out) and
+// in-place like the other sync-backs, so the rest of the file stays
+// byte-for-byte. It only overwrites a key that is already there (a string or
+// null); a zap.json that never recorded version_created_at is left alone.
+//
+// Returns { raw, status }: "updated", "unchanged" (already that value), or
+// "absent" (no version_created_at in that object).
+export function setVersionCreatedAt(raw, versionId, createdAt) {
+  const idRe = new RegExp('"current_version_id":\\s*"' + versionId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + '"');
+  const idMatch = idRe.exec(raw);
+  if (!idMatch) throw new Error(`current_version_id "${versionId}" not found`);
+  const owner = enclosingObjectStart(raw, idMatch.index);
+
+  const keyRe = /("version_created_at":\s*)("(?:[^"\\]|\\.)*"|null)/g;
+  for (let m; (m = keyRe.exec(raw)); ) {
+    if (enclosingObjectStart(raw, m.index) !== owner) continue;
+    const value = JSON.stringify(createdAt);
+    if (m[2] === value) return { raw, status: "unchanged" };
+    return {
+      raw: raw.slice(0, m.index) + m[1] + value + raw.slice(m.index + m[0].length),
+      status: "updated",
+    };
+  }
+  return { raw, status: "absent" };
+}
+
+// Record the new version's created_at. Runs AFTER current_version_id has been
+// synced, and never fails the run: the version is already live, and losing an
+// annotation must not cost the version-id sync-back or the rest of the batch.
+function syncBackVersionCreatedAt(dir, workflowId, newVersionId, createdAt) {
+  try {
+    let at = createdAt;
+    if (!at) at = createdAtOf(unwrap(sdk(["get-workflow-version", workflowId, newVersionId])));
+    if (!at) return `⚠️ Zapier reported no created_at for \`${newVersionId}\` — version_created_at left as it was`;
+    const abs = join(REPO_ROOT, dir, "zap.json");
+    const { raw, status } = setVersionCreatedAt(readFileSync(abs, "utf8"), newVersionId, at);
+    if (status === "updated") writeFileSync(abs, raw);
+    return null;
+  } catch (err) {
+    return `⚠️ could not sync version_created_at (${String(err.message).slice(0, 300)}) — fix it by hand`;
+  }
+}
+
 // A changed catch-hook trigger can be issued a NEW catch URL, and that URL is
 // what every external system POSTs to — so the readback has to land back in
 // zap.json. Same in-place, value-targeted replacement as above (a JSON
 // round-trip would re-encode every escape and reformat the whole file).
+//
+// Returns "changed" when it replaced a different URL, "recorded" when the repo
+// held no URL for this deployment and one was written in, false when there was
+// nothing to do. A deployment whose trigger is not a catch hook is handed no
+// URL at all, so it lands on false.
 export function syncBackWebhookUrl(dir, oldUrl, newUrl) {
-  if (!newUrl || !oldUrl || oldUrl === newUrl) return false;
+  if (!newUrl || oldUrl === newUrl) return false;
   const abs = join(REPO_ROOT, dir, "zap.json");
   const raw = readFileSync(abs, "utf8");
-  const re = new RegExp('("webhook_url":\\s*")' + oldUrl.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + '(")');
-  if (!re.test(raw)) {
-    fail(`${dir}: could not find webhook_url "${oldUrl}" in zap.json to sync back`);
+
+  if (oldUrl) {
+    const re = new RegExp('("webhook_url":\\s*")' + oldUrl.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + '(")');
+    if (!re.test(raw)) {
+      fail(`${dir}: could not find webhook_url "${oldUrl}" in zap.json to sync back`);
+    }
+    writeFileSync(abs, raw.replace(re, `$1${newUrl}$2`));
+    return "changed";
   }
-  writeFileSync(abs, raw.replace(re, `$1${newUrl}$2`));
-  return true;
+
+  // The repo holds no URL for this deployment — the pre-2026-09-06 first
+  // publish dropped it silently, and a republish is the next chance
+  // to record it. Fill a declared null; refuse when there is no key to write
+  // into, or when a multi-deployment file offers more than one and the right
+  // one is ambiguous. Guessing would point the wrong Zap's senders at this URL.
+  const nulls = raw.match(/"webhook_url":\s*null/g) || [];
+  if (nulls.length !== 1) {
+    fail(
+      `${dir}: Zapier reports catch URL ${newUrl} but zap.json records none, and there ` +
+        `${nulls.length === 0 ? "is no \"webhook_url\": null to write it into" : `are ${nulls.length} candidates to write it into`}. ` +
+        `Add "webhook_url": "${newUrl}" to this deployment's trigger block by hand.`,
+    );
+  }
+  writeFileSync(abs, raw.replace(/("webhook_url":\s*)null/, '$1"' + newUrl + '"'));
+  return "recorded";
 }
 
 // Fill in the ids a first publish produced, and retire the `deploy` block's
@@ -854,6 +1032,8 @@ function main() {
       );
       if (args.execute) {
         syncBackFirstPublish(dir, result);
+        const atWarning = syncBackVersionCreatedAt(dir, result.workflowId, result.newVersionId, result.versionCreatedAt);
+        if (atWarning) log(`- ${atWarning}`);
         synced.push({ dir, workflowId: result.workflowId, newVersionId: result.newVersionId, created: true });
         log(`- ✅ created \`${result.workflowId}\`, published \`${result.newVersionId}\`; zap.json updated`);
         if (!plan.enabled) log(`- ⏸️ left DISABLED as declared — enable it when you cut the classic Zap over`);
@@ -885,15 +1065,26 @@ function main() {
       log(`  - live: \`${JSON.stringify(plan.triggerFrom)}\``);
       log(`  - repo: \`${JSON.stringify(plan.triggerTo)}\``);
     }
+    if (plan.connectionsChanged) {
+      log(`- 🔌 connection bindings change — zap.json wins:`);
+      log(`  - live: \`${JSON.stringify(plan.connectionsFrom)}\``);
+      log(`  - repo: \`${JSON.stringify(plan.connectionsTo)}\``);
+    }
     if (args.execute) {
       syncBackVersionId(dir, currentVersionId, newVersionId);
+      const atWarning = syncBackVersionCreatedAt(dir, dep.workflowId, newVersionId, result.versionCreatedAt);
+      if (atWarning) log(`- ${atWarning}`);
       synced.push({ dir, workflowId: dep.workflowId, newVersionId, triggerChanged: plan.triggerChanged });
       log(`- ✅ published new version \`${newVersionId}\`; zap.json updated`);
-      if (syncBackWebhookUrl(dir, result.declaredWebhookUrl, result.webhookUrl)) {
+      const hookSync = syncBackWebhookUrl(dir, result.declaredWebhookUrl, result.webhookUrl);
+      if (hookSync === "changed") {
         log(`- 🔗 catch URL changed to ${result.webhookUrl} — synced back; REPOINT anything that POSTs to the old one`);
+      } else if (hookSync === "recorded") {
+        log(`- 🔗 catch URL ${result.webhookUrl} was missing from zap.json — recorded now (unchanged on Zapier)`);
       }
     } else {
-      log(`- would republish from \`${plan.fromVersion}\` carrying deps/connections/app-versions forward`);
+      log(`- would republish from \`${plan.fromVersion}\` carrying deps/app-versions forward` +
+        (plan.connectionsChanged ? " with the declared connection bindings" : ", connections unchanged"));
     }
     log("");
   }

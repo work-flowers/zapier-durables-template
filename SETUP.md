@@ -32,7 +32,7 @@ node scripts/bootstrap.mjs --client "Acme Ltd" --org work-flowers --repo acme-co
 | --- | --- | --- |
 | `ZAPIER_CLIENT_ID` | `publish-zaps.yml`, `verify-zapier-credentials.yml` | Required, or nothing can publish |
 | `ZAPIER_CLIENT_SECRET` | same | Required |
-| `TEMPLATE_SYNC_TOKEN` | `sync-shared-rules.yml` | Optional. Fine-grained PAT, read-only Contents on the template repo. Without it the sync job skips cleanly rather than failing |
+| `TEMPLATE_SYNC_TOKEN` | `sync-shared-rules.yml` | Not needed while the template is public: the job reads it with the built-in `GITHUB_TOKEN`. Honoured if set (a fine-grained PAT, read-only Contents on the template), so a private template would only need this secret. If the job cannot read the template it **fails loudly** rather than skipping |
 
 Run the **Verify Zapier credentials** workflow manually once to confirm the
 first two work before authoring a Zap.
@@ -46,13 +46,15 @@ Blank on purpose and may silently cause damage if left wrong:
 
 ## 5. What this template deliberately does NOT include
 
-- **The interactive workflow map** (`scripts/build-map.mjs`, `check-map.yml`,
-  `docs/map-overlay.json`). It's genuinely useful, but it carries a per-repo
-  curation burden and publishes to GitHub Pages, which isn't automatically
-  appropriate for a client repo. To adopt it, copy those three files from
-  `work-flowers/zapier-sdk`, change `GITHUB_BASE` in `build-map.mjs`, and add
-  the map back to `publish-zaps.yml` — the sync-back step regenerates it there
-  so a first publish (which fills in `workflow_id`) can't leave the map stale.
+- **The interactive workflow map** (`scripts/build-map.mjs`,
+  `docs/map-overlay.json`, the `zap-map` skill). It's genuinely useful, but it
+  carries a per-repo curation burden and publishes to GitHub Pages, which isn't
+  automatically appropriate for a client repo. To adopt it, copy those three from
+  `work-flowers/zapier-sdk` and change `GITHUB_BASE` in `build-map.mjs`.
+  Leave `publish-zaps.yml` alone: zapier-sdk regenerates its map **by hand
+  only** (no CI refresh, no PR check), so the map trails `zap.json` until
+  someone rebuilds it — after a first publish fills in `workflow_id`, for
+  instance.
 - **Any Zap.** The template ships the pipeline, rules and skills only.
 
 ## 6. How the shared rules stay current
