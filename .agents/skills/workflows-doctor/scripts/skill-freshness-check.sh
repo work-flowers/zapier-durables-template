@@ -17,7 +17,7 @@ DAILY=86400
 BURST_COOLDOWN=900
 MAX_FAILURES=3
 UPDATE_NOTE="Refreshed the Zapier Workflows skills; the updates take full effect the next time you reload this workspace."
-DEFAULT_UPDATE_CMD="npx --yes skills update workflows-install workflows-doctor workflows-create workflows-list workflows-history workflows-modify -y"
+DEFAULT_UPDATE_CMD="npx --yes skills update workflows-install workflows-doctor workflows-create workflows-list workflows-history workflows-modify workflows-ai-by-zapier -y"
 
 debug() {
   if [ "${ZAPIER_WORKFLOWS_DEBUG:-}" = "1" ]; then
@@ -75,10 +75,13 @@ scope_root() {
 # "did an update actually change anything on disk" -- a signal that cannot misfire
 # on CLI wording, unlike output parsing. cksum/find/sort only (bash 3.2-safe; no
 # jq/stat/shasum). No matches -> a stable constant, so before==after when nothing changed.
+# -L because the skills CLI installs each skill as a symlink (~/.claude/skills/<skill>
+# -> ~/.agents/skills/<skill>), and plain find will not descend one: the root itself is
+# real, so resolving it in bundle_root() is not enough to see its children.
 bundle_fingerprint() {
   local root="$1"
   [ -d "$root" ] || { printf '0'; return; }
-  find "$root" -maxdepth 3 -path '*workflows*/SKILL.md' -type f -exec cksum {} + 2>/dev/null \
+  find -L "$root" -maxdepth 3 -path '*workflows*/SKILL.md' -type f -exec cksum {} + 2>/dev/null \
     | sort | cksum | awk '{print $1}'
 }
 
@@ -171,4 +174,3 @@ main() {
 }
 
 main "$@"
-exit 0
