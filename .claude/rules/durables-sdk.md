@@ -14,7 +14,7 @@ and retry design lessons that were learned by shipping the wrong thing.
 
 **Never write `new Date` (or `Date.now()`, `Math.random()`, `fetch`, `setTimeout`) in a durable's workflow body — only inside a `ctx.step`.** `@zapier/zapier-durable` monkey-patches those globals at startup and runs the workflow function in GUARDED mode, so a call outside a step throws `DeterminismViolation: Non-deterministic API "…" called in GUARDED mode`. **The `Date` guard is argument-blind:** its Proxy's `construct` trap asserts *before* looking at the arguments, so `new Date(ms)` and `new Date(Date.UTC(y, m, d))` — both perfectly deterministic — fail exactly as hard as a bare `new Date()`. (`Date.UTC` and `Date.parse` are unguarded, since the `get` trap only special-cases `now`, but don't build on that.)
 
-- **Calendar arithmetic:** integer maths, no `Date` at all. Use the `daysFromCivil` / `isoDateFromEpochMs` / `daysInMonth` helpers — `CLAUDE.md` names where this repo's copy lives. Paying a task for a `ctx.step` just to format a date is absurd.
+- **Calendar arithmetic:** integer maths, no `Date` at all. Use the `daysFromCivil` / `isoDateFromEpochMs` / `daysInMonth` helpers — `CLAUDE.md` names where this repo's copy lives. Wrapping pure date formatting in a `ctx.step` is pointless. A step costs no tasks, but it is journaled and retried, and a format call needs neither.
 - **A genuine clock read:** wrap it, e.g. `await ctx.step("today", async () => isoDateFromEpochMs(Date.now()))`. The value is then fixed for every retry of that run, which is the whole point of the rule.
 - **Nothing catches this before production.** The guard is a runtime component of the durable package — not a lint, not a publish-time check — so `tsc` passes and `publish-workflow-version` succeeds, and the failure only appears when a real payload reaches that line. It has cost a Zap 100% of its runs, and the same latent bug has shipped twice. **When testing a new durable with `run-durable`, use a payload that reaches the main path**, not one that returns at an early guard clause — a skip-path test proves nothing about the code after it.
 
@@ -58,6 +58,8 @@ Check locally with `npx zapier-sdk-experimental validate-workflow "$(jq -n --raw
 Fan out with `sdk.triggerWorkflow({ workflow: <workflow_id>, input })` rather than a plain `fetch` to the public catch URL — the durable sandbox's network allowlist blocks `hooks.zapier.com`, and the internal `trigger_url` needs a JWT the durable cannot mint.
 
 Any fan-out creates a cycle risk. Bound it explicitly: a hop counter refused past a fixed depth, a flag the callee sets that forbids fanning back out, and a guard on the *specific* state that should fan out rather than merely "the earlier guard passed".
+
+**Fan-out multiplies the task minimum.** Each workflow started by `sdk.triggerWorkflow` is a run of its own, with its own 1-task minimum. Zapier's billing article doesn't say whether the `triggerWorkflow` call itself is billed, so count it as 1 task until that is verified.
 
 ## Connections
 
