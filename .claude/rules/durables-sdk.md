@@ -59,7 +59,7 @@ Fan out with `sdk.triggerWorkflow({ workflow: <workflow_id>, input })` rather th
 
 Any fan-out creates a cycle risk. Bound it explicitly: a hop counter refused past a fixed depth, a flag the callee sets that forbids fanning back out, and a guard on the *specific* state that should fan out rather than merely "the earlier guard passed".
 
-**Fan-out multiplies the task minimum.** Each workflow started by `sdk.triggerWorkflow` is a run of its own, with its own 1-task minimum. Zapier's billing article doesn't say whether the `triggerWorkflow` call itself is billed, so count it as 1 task until that is verified.
+**Fan-out multiplies the app actions.** Each workflow started by `sdk.triggerWorkflow` is a run of its own, billed for the app actions it runs. Zapier's billing article doesn't say whether the `triggerWorkflow` call itself is billed, so count it as 1 task until that is verified.
 
 ## Connections
 
