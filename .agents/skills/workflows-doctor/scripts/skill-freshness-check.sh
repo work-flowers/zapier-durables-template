@@ -17,7 +17,7 @@ DAILY=86400
 BURST_COOLDOWN=900
 MAX_FAILURES=3
 UPDATE_NOTE="Refreshed the Zapier Workflows skills; the updates take full effect the next time you reload this workspace."
-DEFAULT_UPDATE_CMD="npx --yes skills update workflows-install workflows-doctor workflows-create workflows-list workflows-history workflows-modify -y"
+DEFAULT_UPDATE_CMD="npx --yes skills update workflows-install workflows-doctor workflows-create workflows-list workflows-history workflows-modify workflows-ai-by-zapier -y"
 
 debug() {
   if [ "${ZAPIER_WORKFLOWS_DEBUG:-}" = "1" ]; then
@@ -75,11 +75,34 @@ scope_root() {
 # "did an update actually change anything on disk" -- a signal that cannot misfire
 # on CLI wording, unlike output parsing. cksum/find/sort only (bash 3.2-safe; no
 # jq/stat/shasum). No matches -> a stable constant, so before==after when nothing changed.
+# -L because the skills CLI installs each skill as a symlink (~/.claude/skills/<skill>
+# -> ~/.agents/skills/<skill>), and plain find will not descend one: the root itself is
+# real, so resolving it in bundle_root() is not enough to see its children.
 bundle_fingerprint() {
   local root="$1"
   [ -d "$root" ] || { printf '0'; return; }
-  find "$root" -maxdepth 3 -path '*workflows*/SKILL.md' -type f -exec cksum {} + 2>/dev/null \
+  find -L "$root" -maxdepth 3 -path '*workflows*/SKILL.md' -type f -exec cksum {} + 2>/dev/null \
     | sort | cksum | awk '{print $1}'
+}
+
+# skills CLI 1.5.x up to 1.5.21 prints "✗ Failed to check for deleted skills from
+# <source>" on every project update from a GitHub source: its deleted-upstream check
+# runs `git clone` on the bare "owner/repo" recorded in skills-lock.json, which is not
+# a clone URL. The CLI then updates each skill anyway and reports a real failure on its
+# own line and in its exit code, so this line on its own is not a failure. Fixed in 1.5.22,
+# but `npx --yes skills` with no version keeps running whichever copy npx cached first,
+# so keep this until DEFAULT_UPDATE_CMD pins skills 1.5.22 or later.
+CLI_BENIGN_LINE="Failed to check for deleted skills from "
+
+# Prints $1 without any line containing CLI_BENIGN_LINE. Pure bash on purpose: grep
+# and BSD sed can drop or reject lines that are not valid UTF-8.
+drop_benign_lines() {
+  local line
+  while IFS= read -r line; do
+    case "$line" in *"$CLI_BENIGN_LINE"*) ;; *) printf '%s\n' "$line" ;; esac
+  done <<EOF
+$1
+EOF
 }
 
 # Primary signal is the fingerprint diff; prose is only a fallback for the rare
@@ -88,13 +111,13 @@ decide_outcome() {
   local before="$1" after="$2" rc="$3" out="$4" lc
   if [ "$before" != "$after" ]; then printf 'updated'; return; fi
   if [ "$rc" -ne 0 ]; then printf 'failed'; return; fi
-  lc="$(printf '%s' "$out" | tr '[:upper:]' '[:lower:]')"
+  lc="$(drop_benign_lines "$out" | tr '[:upper:]' '[:lower:]')"
   # `skills update` exits 0 even on its own errors (e.g. "No installed skills
   # found"), so scan output too. The substrings can overlap benign text like
   # "0 errors"; because the fingerprint check ran first, that only flips a silent
   # noop to a (silent) failed -> retry sooner, never suppresses a real update.
   case "$lc" in
-    *error*|*"not found"*|*enotfound*|*etimedout*|*network*|*failed*) printf 'failed'; return ;;
+    *error*|*"not found"*|*"no installed skills found"*|*enotfound*|*etimedout*|*network*|*failed*) printf 'failed'; return ;;
   esac
   case "$lc" in
     *updated*|*upgraded*|*added*|*"->"*|*"→"*) printf 'updated'; return ;;
@@ -171,4 +194,3 @@ main() {
 }
 
 main "$@"
-exit 0
